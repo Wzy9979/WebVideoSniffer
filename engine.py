@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-下载引擎：直链下载 / HLS 拉流 → ffmpeg 转 MP4 → yt-dlp 兜底。
+下载引擎：多线程分段下载 / HLS 拉流 → ffmpeg 转 MP4、去音轨、抽音轨、音视频合并。
 
-只依赖标准库 + 外部程序 ffmpeg / yt-dlp。
+只依赖标准库 + 外部程序 ffmpeg。
 所有外部进程都用 CREATE_NO_WINDOW 启动，不会闪黑框。
 """
 from __future__ import annotations
@@ -19,8 +19,6 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-
-import sniffer
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
@@ -82,30 +80,6 @@ def find_ffprobe(ffmpeg_path: str = "") -> str:
     return ""
 
 
-def find_ytdlp() -> str:
-    for name in ("yt-dlp", "yt-dlp.exe", "youtube-dl", "youtube-dl.exe"):
-        p = shutil.which(name)
-        if p:
-            return p
-    return ""
-
-
-def find_node() -> str:
-    """yt-dlp 解 YouTube 的 JS 挑战需要一个 JS 运行时。
-
-    它默认只认 deno，但机器上通常已经有 node —— 直接拿来用，不必再装 deno。
-    """
-    for name in ("node", "node.exe"):
-        p = shutil.which(name)
-        if p:
-            return p
-    return ""
-
-
-# --------------------------------------------------------------------------
-# 小工具
-# --------------------------------------------------------------------------
-
 _ILLEGAL_RX = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 _RESERVED = {"CON", "PRN", "AUX", "NUL"} | {f"COM{i}" for i in range(1, 10)} | \
             {f"LPT{i}" for i in range(1, 10)}
@@ -166,22 +140,25 @@ def human_size(n) -> str:
 
 
 class FetchOpts(NamedTuple):
-    """一次取数要带的请求头。referer/UA/Cookie 三者要一起传，所以打成一包。"""
+    """一次取数要带的请求头。referer 和 UA 要一起传，所以打成一包。"""
 
     referer: str = ""
     user_agent: str = ""
-    cookie: str = ""
 
 
-def _headers_block(referer: str, user_agent: str = "",
-                   cookie: str = "") -> str:
+def _headers_block(referer: str, user_agent: str = "") -> str:
     """ffmpeg 的 -headers 需要一整块 \\r\\n 分隔的文本。"""
     lines = [f"User-Agent: {user_agent or UA}"]
     if referer:
         lines.append(f"Referer: {referer}")
-    if cookie:
-        lines.append(f"Cookie: {cookie}")
     return "".join(line + "\r\n" for line in lines)
+
+
+def _fetch_text(url: str, referer: str = "", timeout: int = 20) -> str:
+    """取一份文本（用来读 m3u8 播放列表）。播放列表按规范一定是 UTF-8。"""
+    with urllib.request.urlopen(
+            _request(url, FetchOpts(referer=referer)), timeout=timeout) as r:
+        return r.read(4 * 1024 * 1024).decode("utf-8", "replace")
 
 
 def _request(url: str, opts=None):
@@ -195,8 +172,6 @@ def _request(url: str, opts=None):
     })
     if o.referer:
         req.add_header("Referer", o.referer)
-    if o.cookie:
-        req.add_header("Cookie", o.cookie)
     return req
 
 
@@ -345,8 +320,8 @@ def _download_single(url: str, dest: str, opts=None,
         ctype = (resp.headers.get("Content-Type") or "").lower()
         if ctype.startswith("text/html"):
             raise EngineError(
-                "服务器返回的是网页而不是视频，可能需要登录或防盗链 "
-                "（试试 yt-dlp 下载）")
+                "服务器返回的是网页而不是视频 —— 地址可能过期或需要登录。"
+                "重新嗅探一次；要登录的站点请勾「显示浏览器窗口」先登进去")
         total = int(resp.headers.get("Content-Length") or 0)
         got = 0
         with open(tmp, "wb") as f:
@@ -481,7 +456,7 @@ def download_direct(url: str, dest: str, opts=None,
                     retries: int = 2, threads: int = 1) -> str:
     """下载到 dest。threads > 1 时用多线程分段下载（服务器支持 Range 才行）。
 
-    opts 见 FetchOpts（Referer / User-Agent / Cookie）。
+    opts 见 FetchOpts（Referer / User-Agent）。
     分段不可用时自动退回单线程；失败重试（从头开始，不做断点续传）。
     """
     parent = os.path.dirname(os.path.abspath(dest))
@@ -619,15 +594,73 @@ def mux_tracks(ffmpeg: str, video: str, audio: str, out: str, ffprobe: str = "",
 
 def stream_to_mp4(ffmpeg: str, url: str, out: str, referer: str = "",
                   ffprobe: str = "", on_progress=None,
-                  cancel: threading.Event | None = None) -> str:
-    """把 m3u8 / mpd 直接交给 ffmpeg 边拉边转成 MP4。"""
+                  cancel: threading.Event | None = None,
+                  mode: str = "both", audio_ext: str = ".m4a") -> str:
+    """把 m3u8 / mpd 直接交给 ffmpeg 边拉边转。mode 决定只要画面 / 只要声音 / 都要。"""
     duration = _probe_duration(ffprobe, url, referer)
-    head = ["-headers", _headers_block(referer), "-i", url,
-            "-map", "0:v:0", "-map", "0:a:0?"]
+    if mode == "audio":
+        mapping = ["-map", "0:a:0", "-vn"]
+        moves = [] if out.lower().endswith(".mp3") else ["-movflags", "+faststart", out]
+        stages = ([("拉流转 MP3", ["-c:a", "libmp3lame", "-q:a", "2"])]
+                  if out.lower().endswith(".mp3") else
+                  [("拉流提取音轨", ["-c:a", "copy"]),
+                   ("拉流音频转 AAC", ["-c:a", "aac", "-b:a", "192k"])])
+    elif mode == "video":
+        mapping = ["-map", "0:v:0", "-an"]
+        moves = ["-movflags", "+faststart", out]
+        stages = [("拉流去音轨", ["-c", "copy"]),
+                  ("拉流去音轨重编码",
+                   ["-c:v", "libx264", "-crf", "20", "-preset", "veryfast",
+                    "-pix_fmt", "yuv420p"])]
+    else:
+        mapping = ["-map", "0:v:0", "-map", "0:a:0?"]
+        moves = ["-movflags", "+faststart", out]
+        stages = [("拉流重封装", ["-c", "copy"]),
+                  ("拉流重编码", list(_REENCODE))]
+
+    head = ["-headers", _headers_block(referer), "-i", url] + mapping
+    last_err = ""
+    for label, extra in stages:
+        if cancel is not None and cancel.is_set():
+            raise Canceled()
+        if on_progress:
+            on_progress(0.0, 0, 0)
+        rc, err = _run_ffmpeg(ffmpeg, head + extra + moves, duration,
+                              on_progress, cancel)
+        if rc == 0 and os.path.isfile(out) and os.path.getsize(out) > 0:
+            ov, oa = probe_codecs(ffprobe, out)
+            if mode == "audio":
+                if oa and not ov:
+                    return out
+                last_err = f"{label} 产出 {ov or '?'}/{oa or '?'}，不是纯音频"
+            elif mode == "video":
+                if ov and not oa:
+                    return out
+                last_err = f"{label} 产出 {ov or '?'}/{oa or '?'}，音轨没去掉"
+            elif _mp4_playable(ov, oa):
+                return out
+            else:
+                last_err = f"{label} 产出 {ov or '?'}/{oa or '?'}，播放器放不了"
+        else:
+            last_err = err
+        _silent_remove(out)
+    raise EngineError(f"拉流失败：{last_err}")
+
+
+# --------------------------------------------------------------------------
+# 只要画面 / 只要声音
+# --------------------------------------------------------------------------
+
+def strip_audio(ffmpeg: str, src: str, out: str, ffprobe: str = "",
+                on_progress=None, cancel: threading.Event | None = None) -> str:
+    """做成「只有画面」的 MP4（去掉音轨）。"""
+    duration = _probe_duration(ffprobe, src)
+    bases = ["-i", src, "-map", "0:v:0", "-an"]     # -an = 不要音频
     moves = ["-movflags", "+faststart", out]
     stages = [
-        ("拉流重封装", ["-c", "copy"]),
-        ("拉流重编码", list(_REENCODE)),
+        ("去音轨", ["-c", "copy"]),
+        ("去音轨重编码", ["-c:v", "libx264", "-crf", "20", "-preset",
+                          "veryfast", "-pix_fmt", "yuv420p"]),
     ]
     last_err = ""
     for label, extra in stages:
@@ -635,88 +668,47 @@ def stream_to_mp4(ffmpeg: str, url: str, out: str, referer: str = "",
             raise Canceled()
         if on_progress:
             on_progress(0.0, 0, 0)
-        rc, err = _run_ffmpeg(ffmpeg, head + extra + moves, duration, on_progress, cancel)
+        rc, err = _run_ffmpeg(ffmpeg, bases + extra + moves, duration,
+                              on_progress, cancel)
         if rc == 0 and os.path.isfile(out) and os.path.getsize(out) > 0:
             ov, oa = probe_codecs(ffprobe, out)
-            if _mp4_playable(ov, oa):
+            if ov and not oa:                       # 有画面、且确实没音轨才算成
                 return out
-            last_err = f"{label} 产出 {ov or '?'}/{oa or '?'}，播放器放不了"
+            last_err = f"{label} 产出 {ov or '?'}/{oa or '?'}，音轨没去掉"
         else:
             last_err = err
         _silent_remove(out)
-    raise EngineError(f"拉流转 MP4 失败：{last_err}")
+    raise EngineError(f"去音轨失败：{last_err}")
 
 
-# --------------------------------------------------------------------------
-# yt-dlp 兜底
-# --------------------------------------------------------------------------
+def extract_audio(ffmpeg: str, src: str, out: str, ffprobe: str = "",
+                  on_progress=None, cancel: threading.Event | None = None) -> str:
+    """从任意视频里取出音轨。
 
-_DL_PCT_RX = re.compile(r"\[download\]\s+([\d.]+)%")
-
-
-def _ytdlp_reason(lines) -> str:
-    """从 yt-dlp 的 stderr 里挑出真正有信息量的那一行。
-
-    以前这里直接吞掉，只回一句"下载失败"，用户和我们都无从下手。
+    out 以 .m4a 结尾 → 尽量不重编码（原样搬，瞬间完成）
+    out 以 .mp3 结尾 → 用 libmp3lame 转码
     """
-    for line in reversed(lines):
-        if "ERROR" in line:
-            return line.split("ERROR:", 1)[-1].strip() or line.strip()
-    for line in reversed(lines):
-        if line.strip():
-            return line.strip()
-    return "没有输出（yt-dlp 可能被系统或网络中断）"
-
-
-def ytdlp_download(ytdlp: str, url: str, workdir: str, referer: str = "",
-                   on_progress=None, on_log=None,
-                   cancel: threading.Event | None = None,
-                   threads: int = 1, cookies_from: str = "",
-                   cookies_file: str = "") -> str:
-    """用 yt-dlp 下载，标题保持原视频标题。返回产出的文件路径。"""
-    os.makedirs(workdir, exist_ok=True)
-    before = set(os.listdir(workdir))
-
-    def handle(line: str):
-        m = _DL_PCT_RX.search(line)
-        if m and on_progress:
-            on_progress(float(m.group(1)) / 100.0, 0, 0)
-
-    cmd = [
-        ytdlp, "--no-playlist", "--no-color", "--newline",
-        "--windows-filenames",          # 文件名按 Windows 规则清洗，标题尽量原样保留
-        "--no-mtime",
-        "-f", "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b",
-        "--merge-output-format", "mp4",
-        "-o", os.path.join(workdir, "%(title)s.%(ext)s"),
-    ]
-    if threads > 1:
-        # HLS/DASH 分片并发拉取 —— yt-dlp 自己的多线程下载
-        cmd += ["--concurrent-fragments", str(threads)]
-    if find_node():
-        # 不指定的话 yt-dlp 只认 deno，YouTube 会退化成"部分格式缺失"甚至抓不到
-        cmd += ["--js-runtimes", "node"]
-    if cookies_file:
-        # 手动导出的 cookies.txt —— 绕开浏览器 Cookie 解密，最可靠的一条路
-        cmd += ["--cookies", cookies_file]
-    elif cookies_from:
-        # 需要登录 / 被要求"确认你不是机器人"的站点，靠浏览器 Cookie 过
-        cmd += ["--cookies-from-browser", cookies_from]
-    if referer:
-        cmd += ["--referer", referer]
-    cmd.append(url)
-
-    runner = _ProcRunner(cmd, handle, cancel, on_stderr=on_log)
-    rc = runner.run()
-    if rc != 0:
-        raise EngineError(f"yt-dlp 失败：{_ytdlp_reason(runner.stderr_tail)}")
-
-    new = [f for f in os.listdir(workdir) if f not in before]
-    if not new:
-        raise EngineError("yt-dlp 没产出文件")
-    # 可能有 .part 等中间产物，挑最大的那个
-    new.sort(key=lambda f: os.path.getsize(os.path.join(workdir, f)), reverse=True)
-    return os.path.join(workdir, new[0])
+    duration = _probe_duration(ffprobe, src)
+    want_mp3 = out.lower().endswith(".mp3")
+    bases = ["-i", src, "-map", "0:a:0", "-vn"]
+    if want_mp3:
+        stages = [("转 MP3", ["-c:a", "libmp3lame", "-q:a", "2"])]
+    else:
+        stages = [("提取音轨", ["-c:a", "copy"]),
+                  ("音频转 AAC", ["-c:a", "aac", "-b:a", "192k"])]
+    last_err = ""
+    for label, extra in stages:
+        if cancel is not None and cancel.is_set():
+            raise Canceled()
+        if on_progress:
+            on_progress(0.0, 0, 0)
+        rc, err = _run_ffmpeg(ffmpeg, bases + extra + [out], duration,
+                              on_progress, cancel)
+        if rc == 0 and os.path.isfile(out) and os.path.getsize(out) > 0:
+            return out
+        last_err = err
+        _silent_remove(out)
+    raise EngineError(f"提取音轨失败：{last_err}")
 
 
 def _silent_remove(path: str):
@@ -747,8 +739,8 @@ def resolve_hls(url: str, referer: str = "") -> tuple:
     if not url.lower().split("?")[0].endswith(".m3u8"):
         return url, ""
     try:
-        _, _, text = sniffer.fetch(url, referer)
-    except sniffer.SniffError:
+        text = _fetch_text(url, referer)
+    except (urllib.error.URLError, OSError, ValueError):
         return url, ""                               # 拿不到就原样交给 ffmpeg
     if "#EXT-X-STREAM-INF" not in text.upper():
         return url, ""                               # 本来就是媒体列表
@@ -786,17 +778,21 @@ def resolve_hls(url: str, referer: str = "") -> tuple:
 # --------------------------------------------------------------------------
 
 class Task:
-    """一个下载任务。字段由 GUI 轮询显示。"""
+    """一个下载任务。字段由 GUI 轮询显示。
+
+    mode 决定要哪一部分：
+        "both"  → 画面 + 声音，合成一个 MP4（默认）
+        "video" → 只要画面，无声 MP4
+        "audio" → 只要声音，按 audio_ext 存成 .m4a 或 .mp3
+    """
 
     _seq = 0
     _seq_lock = threading.Lock()
 
     def __init__(self, url: str, title: str, out_dir: str, kind: str = "视频",
-                 referer: str = "", use_ytdlp: bool = False,
-                 keep_source_title: bool = False, threads: int = 8,
-                 cookies_from: str = "", cookies_file: str = "",
-                 user_agent: str = "", cookie: str = "",
-                 audio_url: str = ""):
+                 referer: str = "", threads: int = 8, user_agent: str = "",
+                 audio_url: str = "", mode: str = "both",
+                 audio_ext: str = ".m4a"):
         with Task._seq_lock:
             Task._seq += 1
             self.id = f"t{Task._seq}"
@@ -805,14 +801,11 @@ class Task:
         self.out_dir = out_dir
         self.kind = kind
         self.referer = referer
-        self.use_ytdlp = use_ytdlp
-        self.keep_source_title = keep_source_title
         self.threads = max(1, int(threads))
-        self.cookies_from = cookies_from
-        self.cookies_file = cookies_file
         self.user_agent = user_agent
-        self.cookie = cookie
-        self.audio_url = audio_url        # 画面和声音分开时，补一条声音流
+        self.audio_url = audio_url        # 画面和声音分开时，配套的声音流地址
+        self.mode = mode if mode in ("both", "video", "audio") else "both"
+        self.audio_ext = audio_ext if audio_ext in (".m4a", ".mp3") else ".m4a"
         self.status = "排队中"
         self.progress = 0.0
         self.detail = ""
@@ -823,9 +816,8 @@ class Task:
 
     @property
     def fetch_opts(self) -> FetchOpts:
-        """下载这个任务时该带的请求头（浏览器嗅探来的 UA/Cookie 会在这里生效）。"""
-        return FetchOpts(referer=self.referer, user_agent=self.user_agent,
-                         cookie=self.cookie)
+        """下载这个任务时该带的请求头（浏览器嗅探来的 UA 会在这里生效）。"""
+        return FetchOpts(referer=self.referer, user_agent=self.user_agent)
 
     def emit(self):
         if self.notify:
@@ -860,8 +852,8 @@ def _prune_tmp_parent(out_dir: str):
         pass
 
 
-def run_task(task: Task, ffmpeg: str, ffprobe: str, ytdlp: str, log=print):
-    """执行一个任务：下载（必要时转码）→ 落盘为「标题.mp4」。
+def run_task(task: Task, ffmpeg: str, ffprobe: str, log=print):
+    """执行一个任务：下载要的那部分 → 落盘。
 
     中间文件全部待在 .tmp/<任务id>/ 里 —— 每个任务一个目录。
     共用一个 .tmp 的话，先结束的任务会把还在下载的任务的目录一起删掉。
@@ -876,70 +868,99 @@ def run_task(task: Task, ffmpeg: str, ffprobe: str, ytdlp: str, log=print):
             task.detail = f"{human_size(got)} / {human_size(total)}"
         task.emit()
 
-    try:
-        src_path = ""
+    def done(staged, ext=".mp4"):
+        task.set(status="完成", progress=1.0,
+                 out_path=_place(staged, task.out_dir, task.title, ext))
+        log(f"[{task.title}] ✓ 完成 → {os.path.basename(task.out_path)}")
 
-        if task.use_ytdlp:
-            if not ytdlp:
-                raise EngineError(
-                    "没找到 yt-dlp。安装：winget install yt-dlp.yt-dlp")
-            task.set(status="yt-dlp 下载中", progress=0.0)
-            log(f"[{task.title}] 交给 yt-dlp…")
-            src_path = ytdlp_download(ytdlp, task.url, tmp_dir, task.referer,
-                                      prog, log, task.cancel, task.threads,
-                                      task.cookies_from, task.cookies_file)
-            if task.keep_source_title:
-                # yt-dlp 按 %(title)s 命名，那就是最原汁原味的视频标题
-                stem = os.path.splitext(os.path.basename(src_path))[0]
-                real = sanitize(strip_media_ext(stem))
-                if real:
-                    task.title = real
-                    task.emit()
-        elif task.kind in ("HLS", "DASH", "SmoothStreaming"):
+    def grab(url, name):
+        """下载一条流到 tmp 目录，返回本地路径。"""
+        path = os.path.join(tmp_dir, name)
+        download_direct(url, path, task.fetch_opts, prog, task.cancel,
+                        threads=task.threads)
+        return path
+
+    try:
+        need_audio = task.mode in ("both", "audio")
+        need_video = task.mode in ("both", "video")
+
+        # ---- 拉流（m3u8 / mpd）：交给 ffmpeg 边拉边转 ----
+        if task.kind in ("HLS", "DASH", "SmoothStreaming"):
             if not ffmpeg:
                 raise EngineError("拉流需要 ffmpeg，请先安装并确保在 PATH 中")
             task.set(status="拉流中", progress=0.0)
             target, note = resolve_hls(task.url, task.referer)
             if note:
                 log(f"[{task.title}] {note}")
-            log(f"[{task.title}] ffmpeg 拉流并转 MP4…")
-            staged = os.path.join(tmp_dir, "out.mp4")
+            log(f"[{task.title}] ffmpeg 拉流…")
+            ext = task.audio_ext if task.mode == "audio" else ".mp4"
+            staged = os.path.join(tmp_dir, "out" + ext)
             stream_to_mp4(ffmpeg, target, staged, task.referer, ffprobe,
-                          prog, task.cancel)
-            task.set(status="完成", progress=1.0,
-                     out_path=_place(staged, task.out_dir, task.title))
-            log(f"[{task.title}] ✓ 完成 → {os.path.basename(task.out_path)}")
+                          prog, task.cancel, mode=task.mode,
+                          audio_ext=task.audio_ext)
+            done(staged, ext)
             return
-        else:
-            task.set(status="下载中", progress=0.0)
-            log(f"[{task.title}] 直链下载（{task.threads} 线程）…")
-            src_path = os.path.join(tmp_dir, "src" + (ext_of(task.url) or ".bin"))
-            download_direct(task.url, src_path, task.fetch_opts, prog, task.cancel,
-                            threads=task.threads)
 
-        # 画面和声音是分开的两条流（DASH 站点）→ 两条都下，再合成一个
-        if task.audio_url and ffmpeg:
+        # ---- 「只要声音」：优先直接下那条声音轨，省掉整个视频 ----
+        if task.mode == "audio" and task.audio_url:
+            log(f"[{task.title}] 只要声音，直接下声音轨（不碰视频）…")
+            task.set(status="下载声音轨", progress=0.0)
+            audio = grab(task.audio_url, "audio" + (ext_of(task.audio_url) or ".m4a"))
+            ext = task.audio_ext
+            staged = os.path.join(tmp_dir, "out" + ext)
+            if ffmpeg:
+                task.set(status="转音频格式", progress=0.0)
+                extract_audio(ffmpeg, audio, staged, ffprobe, prog, task.cancel)
+                done(staged, ext)
+            else:
+                done(audio, ext_of(task.audio_url) or ".m4a")
+            return
+
+        # ---- 其余情况：先下主地址 ----
+        task.set(status="下载中", progress=0.0)
+        log(f"[{task.title}] 直链下载（{task.threads} 线程）…")
+        src_path = grab(task.url, "src" + (ext_of(task.url) or ".bin"))
+
+        # ---- 「两者都要」且音视频分流：补下声音轨再合成 ----
+        if need_audio and need_video and task.audio_url and ffmpeg:
             task.set(status="下载声音轨", progress=0.0)
             log(f"[{task.title}] 画面和声音是分开的两条流，再下一条声音轨…")
-            audio_path = os.path.join(
-                tmp_dir, "audio" + (ext_of(task.audio_url) or ".m4a"))
-            download_direct(task.audio_url, audio_path, task.fetch_opts, None,
-                            task.cancel, threads=1)
+            audio = grab(task.audio_url, "audio" + (ext_of(task.audio_url) or ".m4a"))
             task.set(status="合并音视频", progress=0.0)
             log(f"[{task.title}] 合并画面与声音…")
             staged = os.path.join(tmp_dir, "out.mp4")
-            mux_tracks(ffmpeg, src_path, audio_path, staged, ffprobe,
-                       prog, task.cancel)
-            task.set(status="完成", progress=1.0,
-                     out_path=_place(staged, task.out_dir, task.title))
-            log(f"[{task.title}] ✓ 完成 → {os.path.basename(task.out_path)}")
+            mux_tracks(ffmpeg, src_path, audio, staged, ffprobe, prog, task.cancel)
+            done(staged)
             return
 
-        # 到这里手上是一个本地文件，统一处理成 MP4
+        # ---- 「只要声音」但源是合在一起的：从视频里抽音轨 ----
+        if task.mode == "audio":
+            if not ffmpeg:
+                raise EngineError("抽音轨需要 ffmpeg，请先安装并确保在 PATH 中")
+            ext = task.audio_ext
+            staged = os.path.join(tmp_dir, "out" + ext)
+            task.set(status="提取音轨", progress=0.0, detail="")
+            log(f"[{task.title}] 从视频里提取音轨 → {ext}…")
+            extract_audio(ffmpeg, src_path, staged, ffprobe, prog, task.cancel)
+            done(staged, ext)
+            return
+
+        # ---- 「只要画面」：去掉音轨 ----
+        if task.mode == "video":
+            if not ffmpeg:
+                # 没 ffmpeg 就原样给出（源本来可能就是纯画面轨）
+                done(src_path, ext_of(task.url) or ".mp4")
+                return
+            staged = os.path.join(tmp_dir, "out.mp4")
+            task.set(status="去掉音轨", progress=0.0, detail="")
+            log(f"[{task.title}] 只要画面，去掉音轨…")
+            strip_audio(ffmpeg, src_path, staged, ffprobe, prog, task.cancel)
+            done(staged)
+            return
+
+        # ---- 两者都要，且本来就是完整文件 ----
         if src_path.lower().endswith(".mp4"):
-            task.set(status="完成", progress=1.0,
-                     out_path=_place(src_path, task.out_dir, task.title))
-            log(f"[{task.title}] ✓ 完成 → {os.path.basename(task.out_path)}")
+            done(src_path)
             return
 
         if not ffmpeg:
@@ -955,9 +976,7 @@ def run_task(task: Task, ffmpeg: str, ffprobe: str, ytdlp: str, log=print):
         log(f"[{task.title}] 转 MP4…")
         staged = os.path.join(tmp_dir, "out.mp4")
         convert_to_mp4(ffmpeg, src_path, staged, ffprobe, prog, task.cancel)
-        task.set(status="完成", progress=1.0,
-                 out_path=_place(staged, task.out_dir, task.title))
-        log(f"[{task.title}] ✓ 完成 → {os.path.basename(task.out_path)}")
+        done(staged)
     except Canceled:
         task.set(status="已取消", detail="")
         log(f"[{task.title}] 已取消")

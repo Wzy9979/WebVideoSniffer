@@ -96,6 +96,45 @@ def _ext_of(url: str) -> str:
     return "." + m.group(1).lower() if m else ""
 
 
+def _ext_for(url: str, mime: str = "") -> str:
+    """推断扩展名：先看 URL 后缀，再看 CDP 给的 mime，最后看 query 里的 mime_type。
+
+    抖音那种地址长这样，路径上根本没有后缀，只能靠 mime 判断：
+        .../video/tos/cn/xxx/?a=6383&...&mime_type=video_mp4&...
+    """
+    ext = _ext_of(url)
+    if ext:
+        return ext
+    low = (mime or "").lower()
+    if low:
+        if "mpegurl" in low or "m3u8" in low:
+            return ".m3u8"
+        if "dash" in low:
+            return ".mpd"
+        if low.startswith("audio/"):
+            return ".mp3" if "mpeg" in low else ".m4a"
+        if "mp4" in low:
+            return ".mp4"
+        if "webm" in low:
+            return ".webm"
+        if "matroska" in low:
+            return ".mkv"
+    try:
+        q = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)
+    except ValueError:
+        return ""
+    mt = (q.get("mime_type") or [""])[0].lower()
+    if "mp4" in mt or "m4v" in mt:
+        return ".mp4"
+    if "mpegurl" in mt:
+        return ".m3u8"
+    if "webm" in mt:
+        return ".webm"
+    if "matroska" in mt:
+        return ".mkv"
+    return ""
+
+
 def find_browser() -> str:
     """找一个可用的 Edge / Chrome。"""
     for name in ("msedge", "msedge.exe", "chrome", "chrome.exe"):
@@ -561,6 +600,7 @@ class BrowserSession:
 
         urls = [{"url": u, "source": src, "bytes": n, "playing": playing,
                  "track": _track_of(u, mime),
+                 "ext": _ext_for(u, mime),
                  "audio_url": primary_audio if i == 0 else ""}
                 for i, (u, src, n, playing, mime) in enumerate(found)]
 
