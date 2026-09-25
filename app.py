@@ -26,7 +26,10 @@ from tkinter import messagebox, ttk
 import engine
 from browser import BrowserError, sniff_with_browser
 
-APP_DIR = os.path.dirname(os.path.abspath(__file__))
+# 打包成 exe 后 __file__ 指向 PyInstaller 的临时解包目录（退出即删），
+# downloads / browser_profile 必须落在 exe 旁边。
+APP_DIR = os.path.dirname(os.path.abspath(
+    sys.executable if getattr(sys, "frozen", False) else __file__))
 DEFAULT_OUT = os.path.join(APP_DIR, "downloads")
 BROWSER_PROFILE = os.path.join(APP_DIR, "browser_profile")
 MAX_WORKERS = 2

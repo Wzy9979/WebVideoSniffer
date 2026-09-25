@@ -43,3 +43,8 @@ desktop.ini
 
 # 日志
 *.log
+
+# PyInstaller 打包产物（只保留源码和 run.bat）
+build/
+dist/
+*.spec
